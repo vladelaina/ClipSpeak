@@ -1,0 +1,38 @@
+name: Build EXE
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install ffmpeg
+        run: choco install ffmpeg -y
+      
+      - name: Install dependencies
+        run: |
+          pip install pyinstaller edge-tts keyboard pyperclip
+      
+      - name: Build EXE
+        shell: pwsh
+        run: |
+          $ffplay = (Get-Command ffplay).Source
+          pyinstaller clipboard_reader.py --onefile --noconsole --name=ClipboardReader --add-binary="$ffplay;." --hidden-import=edge_tts --hidden-import=aiohttp --clean
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClipboardReader
+          path: dist/ClipboardReader.exe

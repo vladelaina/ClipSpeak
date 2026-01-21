@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 剪贴板朗读工具
-快捷键: Ctrl+Alt+R
+快捷键: Alt+C
 - 按下时朗读剪贴板内容
 - 再次按下取消朗读
 """
@@ -162,11 +162,11 @@ def on_hotkey():
 
 def main():
     print("剪贴板朗读工具已启动")
-    print("快捷键: Ctrl+Alt+R")
+    print("快捷键: Alt+C")
     print("按 Ctrl+C 退出")
     print("-" * 30)
     
-    keyboard.add_hotkey('ctrl+alt+r', on_hotkey)
+    keyboard.add_hotkey('alt+c', on_hotkey)
     
     try:
         keyboard.wait()

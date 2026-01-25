@@ -1,0 +1,4 @@
+edge-tts
+keyboard
+pyperclip
+aiohttp

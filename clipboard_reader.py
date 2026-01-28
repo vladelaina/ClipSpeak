@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-剪贴板朗读工具 (ClipSpeak Pro Ultimate Debug)
+剪贴板朗读工具 (Verbose Trace Edition)
 快捷键: Alt+C
-- 全链路详细日志追踪
-- 针对长时运行优化
-- 针对极端文本优化
-- 针对网络波动优化
+- 开启全量日志追踪
+- 记录每一段的下载耗时
+- 记录播放器的首包响应
 """
 
 import threading
@@ -20,6 +19,7 @@ import traceback
 import asyncio
 import time
 import re
+import platform
 
 import edge_tts
 import keyboard
@@ -27,7 +27,7 @@ import pyperclip
 
 
 def get_ffplay_path():
-    """获取 ffplay 路径，优先使用系统路径，打包后使用内置路径"""
+    """获取 ffplay 路径"""
     if getattr(sys, 'frozen', False):
         base_path = sys._MEIPASS
         return os.path.join(base_path, "ffplay.exe")
@@ -39,23 +39,28 @@ def get_ffplay_path():
 VOICE = "zh-CN-XiaoxiaoNeural"
 RATE = "+100%"  
 SPEED = 1.5     
-CHUNK_MIN_SIZE = 300  # 最小聚合
-CHUNK_MAX_SIZE = 800  # 最大切分
-HARD_LIMIT_SIZE = 1000 # 强制切分阈值
+CHUNK_MIN_SIZE = 300
+CHUNK_MAX_SIZE = 800
+HARD_LIMIT_SIZE = 1000
 
-# 全局状态
 lock = threading.Lock()
 is_playing = False
 ffplay_process = None
 
-# 预编译正则
 RE_SPLIT = re.compile(r'([。！？；!?;])')
 
 
-def log(msg):
+def log(msg, level="INFO"):
     """带时间戳的日志输出"""
-    timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3] # 精确到毫秒
-    print(f"[{timestamp}] {msg}")
+    timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    print(f"[{timestamp}] [{level}] {msg}")
+
+
+def log_memory_stats():
+    """内存健康度检查"""
+    gc.collect()
+    obj_count = len(gc.get_objects())
+    log(f"内存快照: 对象数 {obj_count} | GC: {gc.get_stats()}", "MEM")
 
 
 def check_singleton():
@@ -72,49 +77,38 @@ def stop_playback(clear_flags=True):
     """停止播放并执行深度清理"""
     global is_playing, ffplay_process
     
-    # 1. 标志位管理
     with lock:
         if clear_flags:
             if is_playing:
-                log("状态变更: is_playing -> False")
+                log("状态机变更: Running -> Stopped", "STATE")
             is_playing = False
         proc = ffplay_process
         ffplay_process = None
     
-    # 2. 进程清理
     if proc:
-        log(f"正在停止播放器进程 (PID: {proc.pid})...")
+        log(f"终止播放器进程 (PID: {proc.pid})", "CLEAN")
         try:
             proc.stdin.close()
-        except:
-            pass
+        except: pass
         try:
             proc.terminate()
             proc.wait(timeout=1)
-            log("播放器进程已正常终止")
         except:
             try:
                 proc.kill()
-                log("播放器进程被强制 Kill")
-            except Exception as e:
-                log(f"无法终止进程: {e}")
+            except: pass
     
-    # 3. 兜底清理
     if sys.platform == "win32":
         try:
-            # 仅在真的有残留时才可能起作用，平时静默
             subprocess.run(["taskkill", "/F", "/IM", "ffplay.exe"], 
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
+        except: pass
 
 
 def split_text_smart_v3(text):
-    """V3 分块算法 (带详细日志)"""
-    log("正在进行文本分块分析...")
+    """分块算法"""
     text = text.replace("#", "").replace("*", "").replace("\r", "")
-    if not text.strip():
-        return []
+    if not text.strip(): return []
     
     raw_lines = text.split('\n')
     chunks = []
@@ -122,8 +116,7 @@ def split_text_smart_v3(text):
     
     for line in raw_lines:
         line = line.strip()
-        if not line:
-            continue
+        if not line: continue
             
         if len(buffer) + len(line) < CHUNK_MIN_SIZE:
             buffer += line + "，" 
@@ -139,40 +132,34 @@ def split_text_smart_v3(text):
             else:
                 buffer = line + "，"
         else:
-            # 长难句处理
-            log(f"DEBUG: 发现长难句 ({len(line)} 字符)，执行标点切分...")
+            log(f"处理长难句 ({len(line)}字符)，执行硬切分", "TEXT")
             sub_parts = RE_SPLIT.split(line)
             sub_buffer = ""
             for part in sub_parts:
                 if len(part) > HARD_LIMIT_SIZE:
-                    log(f"DEBUG: 触发强制硬切分 (片段长度 {len(part)} > {HARD_LIMIT_SIZE})")
                     if sub_buffer:
                         chunks.append(sub_buffer)
                         sub_buffer = ""
                     for k in range(0, len(part), HARD_LIMIT_SIZE):
                         chunks.append(part[k:k+HARD_LIMIT_SIZE])
                 elif len(sub_buffer) + len(part) > CHUNK_MAX_SIZE:
-                    if sub_buffer:
-                        chunks.append(sub_buffer)
+                    if sub_buffer: chunks.append(sub_buffer)
                     sub_buffer = part
                 else:
                     sub_buffer += part
-            
-            if sub_buffer:
-                chunks.append(sub_buffer)
+            if sub_buffer: chunks.append(sub_buffer)
     
-    if buffer:
-        chunks.append(buffer)
-        
-    log(f"分块完成: 共 {len(chunks)} 个片段")
+    if buffer: chunks.append(buffer)
+    
+    # log(f"文本分块完成: {len(chunks)} 块", "TEXT")
     return chunks
 
 
 def audio_producer(text_chunks, data_queue):
-    """生产者：下载音频 (详细日志版)"""
+    """生产者 (完整日志版)"""
     global is_playing
     total_chunks = len(text_chunks)
-    log(f"生产者线程启动 (任务数: {total_chunks})")
+    log(f"下载线程启动 (任务队列: {total_chunks})", "NET")
     
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -180,81 +167,80 @@ def audio_producer(text_chunks, data_queue):
     try:
         for i, chunk_text in enumerate(text_chunks):
             with lock:
-                if not is_playing: 
-                    log("生产者检测到停止信号，退出循环")
-                    break
+                if not is_playing: break
             
             max_retries = 3
             for attempt in range(max_retries):
                 try:
-                    log(f"-> [下载] 第 {i+1}/{total_chunks} 段启动 ({len(chunk_text)} 字符)...")
                     start_time = time.time()
+                    log(f"-> 开始下载第 {i+1}/{total_chunks} 段 ({len(chunk_text)} 字符)...", "NET")
                     
                     communicate = edge_tts.Communicate(chunk_text, VOICE, rate=RATE)
                     async_gen = communicate.stream()
                     iterator = async_gen.__aiter__()
                     
-                    chunk_count = 0
-                    bytes_total = 0
+                    chunk_size_total = 0
                     
                     while True:
                         with lock:
                             if not is_playing: break
                         
                         try:
-                            # 10s 网络超时熔断
+                            # 10s 超时
                             chunk = loop.run_until_complete(
                                 asyncio.wait_for(iterator.__anext__(), timeout=10)
                             )
+                            
                             if chunk["type"] == "audio":
-                                # put 使用超时
                                 while is_playing:
                                     try:
                                         data_queue.put(chunk["data"], timeout=1)
-                                        chunk_count += 1
-                                        bytes_total += len(chunk["data"])
+                                        chunk_size_total += len(chunk["data"])
                                         break
                                     except queue.Full:
-                                        # log("DEBUG: 队列已满，生产者等待中...")
+                                        # log("缓冲区满，等待消费...", "WARN") # 过于频繁，注释掉
                                         continue
                             elif chunk["type"] == "error":
                                 raise Exception(f"TTS Error: {chunk['message']}")
+                                
                         except StopAsyncIteration:
                             break
                         except asyncio.TimeoutError:
                             raise Exception("Network Timeout (10s)")
                     
                     duration = time.time() - start_time
-                    log(f"<- [下载] 第 {i+1} 段完成: {bytes_total} bytes, 耗时 {duration:.2f}s")
-                    break # 成功
+                    log(f"<- 第 {i+1} 段下载完成 ({chunk_size_total/1024:.1f} KB, 耗时 {duration:.2f}s)", "NET")
+                    break 
                     
                 except Exception as e:
                     with lock:
                         if not is_playing: break
                     
                     if attempt < max_retries - 1:
-                        log(f"!! [警告] 网络异常: {e}. 1秒后重试 ({attempt+1}/{max_retries})...")
+                        log(f"!! 网络连接失败: {e}. 1s后重试 ({attempt+1}/{max_retries})", "WARN")
                         time.sleep(1.0)
                     else:
-                        log(f"!! [错误] 第 {i+1} 段下载最终失败: {e}")
+                        log(f"!! 第 {i+1} 段下载最终失败: {e}", "ERR")
             
     except Exception as e:
-        log(f"!! 生产者线程发生未捕获异常: {e}")
+        log(f"生产者线程崩溃: {e}", "FATAL")
         traceback.print_exc()
     finally:
         try:
-            loop.close()
-        except:
-            pass
+            if loop.is_running(): loop.stop()
+            if not loop.is_closed():
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                loop.run_until_complete(asyncio.sleep(0.250)) 
+                loop.close()
+        except: pass
         try:
             data_queue.put(None, timeout=2)
-        except:
-            pass
-        log("生产者线程结束")
+        except: pass
+        log("生产者线程退出", "NET")
 
 
 def play_clipboard():
-    """消费者：音频播放 (详细日志版)"""
+    """消费者 (完整日志版)"""
     global is_playing, ffplay_process
     
     text = None
@@ -265,53 +251,36 @@ def play_clipboard():
     try:
         text = pyperclip.paste()
         if not text or not text.strip():
-            log("错误: 剪贴板为空")
+            log("剪贴板内容为空", "WARN")
             with lock: is_playing = False
             return
-        
-        # 预览日志
-        preview = text[:50].replace('\n', ' ')
-        log(f"剪贴板内容预览: [{preview}...] (总长: {len(text)})")
             
-        # 启动前清理
+        # 内容预览 (关键日志)
+        preview = text[:30].replace('\n', ' ')
+        log(f"捕获任务: [{preview}... ] (长度: {len(text)})", "DATA")
+        
         stop_playback(clear_flags=False)
         
-        # 1. 文本处理
         text_chunks = split_text_smart_v3(text)
         if not text_chunks:
-            log("错误: 文本分块后为空")
             with lock: is_playing = False
             return
+        
+        log(f"文本分块完成: 共 {len(text_chunks)} 块", "TEXT")
 
-        # 2. 启动播放器
-        # 增加 probe size 防止奇怪格式导致 probe 失败
-        ffplay_cmd = [
+        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        proc = subprocess.Popen([
             get_ffplay_path(), "-nodisp", "-autoexit", "-i", "pipe:0",
-            "-af", f"atempo={SPEED}" if SPEED < 2.0 else "atempo=2.0,atempo={SPEED/2}", # 简单处理filter
+            "-af", f"atempo={SPEED}" if SPEED < 2.0 else "atempo=2.0,atempo={{SPEED/2}}",
             "-probesize", "4096", "-analyzeduration", "0", 
             "-loglevel", "error"
-        ]
-        
-        # 重新构建 filter string (更严谨)
-        atempo_filters = []
-        speed_temp = SPEED
-        while speed_temp > 2.0:
-            atempo_filters.append("atempo=2.0")
-            speed_temp /= 2.0
-        if speed_temp != 1.0:
-            atempo_filters.append(f"atempo={speed_temp}")
-        filter_str = ",".join(atempo_filters) if atempo_filters else "anull"
-        ffplay_cmd[6] = filter_str # 替换上面简单写的 filter
-        
-        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        proc = subprocess.Popen(ffplay_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=sys.stderr, creationflags=creationflags)
+        ], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=sys.stderr, creationflags=creationflags)
         
         with lock:
             ffplay_process = proc
         
-        log(f"FFplay 播放器已启动 (PID: {proc.pid})")
+        log(f"播放器进程已挂载 (PID: {proc.pid})", "PROC")
 
-        # 3. 启动生产者
         data_queue = queue.Queue(maxsize=100)
         producer_thread = threading.Thread(
             target=audio_producer, 
@@ -320,11 +289,10 @@ def play_clipboard():
         )
         producer_thread.start()
         
-        # 4. 消费者循环
-        log("开始进入播放循环...")
+        log("等待数据流...", "INFO")
         byte_count = 0
         chunk_idx = 0
-        wait_log_printed = False
+        first_byte_time = None
         
         while True:
             with lock:
@@ -332,44 +300,43 @@ def play_clipboard():
                 current_proc = ffplay_process
             
             if current_proc and current_proc.poll() is not None:
-                log(f"警告: 播放器进程意外退出 (Code: {current_proc.returncode})")
+                log(f"播放器意外退出 (Exit Code: {current_proc.returncode})", "ERR")
                 break
                 
             try:
-                # 获取数据
                 chunk_data = data_queue.get(timeout=0.5)
-                
                 if chunk_data is None:
-                    log("收到数据流结束标志 (None)")
+                    log("收到 EOF 结束信号", "INFO")
                     break
-                
-                wait_log_printed = False # 重置等待日志标志
                 
                 try:
                     current_proc.stdin.write(chunk_data)
                     byte_count += len(chunk_data)
                     chunk_idx += 1
                     
-                    # 适度打日志，防止刷屏
+                    # 关键日志：首包确认
+                    if first_byte_time is None:
+                        first_byte_time = datetime.datetime.now()
+                        log(">> 首包数据已写入播放器 (声音开始)", "PLAY")
+                    
+                    # 进度日志：每写入一定数量包，或者是最后一段时
+                    # 10 个包大约是 0.5 秒左右的数据，适合做心跳
                     if chunk_idx % 10 == 0:
-                        log(f"播放进度: 已写入 {chunk_idx} 个数据包 (累计 {byte_count/1024:.1f} KB)")
+                        log(f"播放中... 已写入 {chunk_idx} 包 ({byte_count/1024:.1f} KB)", "PLAY")
                         
                 except Exception as e:
-                    log(f"写入播放器失败: {e}")
+                    log(f"写入管道失败: {e}", "ERR")
                     break
                     
             except queue.Empty:
                 if not producer_thread.is_alive():
-                    log("队列为空且生产者已结束，停止播放")
+                    log("数据源已耗尽", "INFO")
                     break
-                
-                if not wait_log_printed:
-                    log("缓冲中... (等待网络数据)")
-                    wait_log_printed = True
+                log("缓冲中... (Waiting for Net)", "WARN")
                 continue
 
-        # 5. 结尾处理
-        log(f"数据传输结束，等待播放完毕 (总流量: {byte_count/1024:.2f} KB)")
+        log(f"播放结束 (总流量: {byte_count/1024:.2f} KB)", "INFO")
+        
         with lock:
             current_proc = ffplay_process
             still_playing = is_playing
@@ -378,14 +345,13 @@ def play_clipboard():
             try:
                 current_proc.stdin.close()
                 current_proc.wait(timeout=3)
-            except:
-                pass
+            except: pass
 
     except Exception as e:
-        log(f"消费者线程致命错误: {e}")
+        log(f"主线程异常: {e}", "FATAL")
         traceback.print_exc()
     finally:
-        log("执行最终资源回收...")
+        log("开始资源回收...", "CLEAN")
         stop_playback()
         
         if data_queue:
@@ -394,8 +360,8 @@ def play_clipboard():
         del text, text_chunks, data_queue, producer_thread
         gc.collect()
         
-        active_count = threading.active_count()
-        log(f"任务完全结束 (当前活动线程: {active_count})")
+        log_memory_stats()
+        log("会话结束", "INFO")
 
 
 def on_hotkey():
@@ -403,28 +369,27 @@ def on_hotkey():
     with lock: playing = is_playing
     
     if playing:
-        log("快捷键触发: 停止")
+        log(">> 用户触发停止 <<", "USER")
         stop_playback()
     else:
-        log("快捷键触发: 开始")
+        log(">> 用户触发朗读 <<", "USER")
         with lock: is_playing = True
         threading.Thread(target=play_clipboard, daemon=True).start()
 
 
 def main():
     if not check_singleton():
-        print("错误: 程序已在运行中 (端口 45678 被占用)")
+        print("!! 程序已在运行中 !!")
         sys.exit(0)
 
     keyboard.add_hotkey('alt+c', on_hotkey)
-    log("=== ClipSpeak Pro Ultimate Debug Edition ===")
-    log("系统就绪。请按 Alt+C 朗读剪贴板内容。")
-    log("按 Ctrl+C 退出程序。")
+    
+    log(f"=== ClipSpeak Pro (Verbose Trace) ===", "INIT")
+    log(f"PID={os.getpid()} | Python {sys.version.split()[0]}", "INIT")
     
     try:
         keyboard.wait()
     except KeyboardInterrupt:
-        log("收到退出信号，正在关闭...")
         stop_playback()
 
 if __name__ == "__main__":

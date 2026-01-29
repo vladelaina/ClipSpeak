@@ -268,6 +268,12 @@ def play_clipboard():
         
         log(f"文本分块完成: 共 {len(text_chunks)} 块", "TEXT")
 
+        # [Final Check] 启动前最后确认状态，防止在分块期间用户已停止
+        with lock:
+            if not is_playing:
+                log("检测到停止信号，取消启动播放器", "INFO")
+                return
+
         creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         proc = subprocess.Popen([
             get_ffplay_path(), "-nodisp", "-autoexit", "-i", "pipe:0",
@@ -365,14 +371,22 @@ def play_clipboard():
 
 
 def on_hotkey():
+    """
+    快捷键回调：必须极速返回，防止 Windows 移除过慢的钩子
+    """
     global is_playing
-    with lock: playing = is_playing
     
-    if playing:
-        log(">> 用户触发停止 <<", "USER")
-        stop_playback()
+    # 快速读取状态
+    with lock: 
+        current_state = is_playing
+    
+    if current_state:
+        log(">> 快捷键触发: 停止 (异步处理) <<", "USER")
+        # 关键修改：停止操作包含进程等待，必须放入线程，不可阻塞钩子
+        threading.Thread(target=stop_playback, daemon=True).start()
     else:
-        log(">> 用户触发朗读 <<", "USER")
+        log(">> 快捷键触发: 开始 (异步处理) <<", "USER")
+        # 先设置标志位防止重复触发
         with lock: is_playing = True
         threading.Thread(target=play_clipboard, daemon=True).start()
 

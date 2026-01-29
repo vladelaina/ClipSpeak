@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-剪贴板朗读工具 (Verbose Trace Edition)
+剪贴板朗读工具 (Low Latency Edition)
 快捷键: Alt+C
-- 开启全量日志追踪
-- 记录每一段的下载耗时
-- 记录播放器的首包响应
+- 极速启动：零缓冲播放参数
+- 性能监控：精确记录首响延迟
 """
 
 import threading
@@ -46,6 +45,7 @@ HARD_LIMIT_SIZE = 1000
 lock = threading.Lock()
 is_playing = False
 ffplay_process = None
+start_press_time = None # 记录按下快捷键的时间
 
 RE_SPLIT = re.compile(r'([。！？；!?;])')
 
@@ -151,7 +151,6 @@ def split_text_smart_v3(text):
     
     if buffer: chunks.append(buffer)
     
-    # log(f"文本分块完成: {len(chunks)} 块", "TEXT")
     return chunks
 
 
@@ -175,11 +174,14 @@ def audio_producer(text_chunks, data_queue):
                     start_time = time.time()
                     log(f"-> 开始下载第 {i+1}/{total_chunks} 段 ({len(chunk_text)} 字符)...", "NET")
                     
+                    conn_start_time = time.time() # 记录连接开始时间
+                    
                     communicate = edge_tts.Communicate(chunk_text, VOICE, rate=RATE)
                     async_gen = communicate.stream()
                     iterator = async_gen.__aiter__()
                     
                     chunk_size_total = 0
+                    is_first_chunk = True # 标记是否为首包
                     
                     while True:
                         with lock:
@@ -191,6 +193,12 @@ def audio_producer(text_chunks, data_queue):
                                 asyncio.wait_for(iterator.__anext__(), timeout=10)
                             )
                             
+                            # 记录首包到达时间 (TTFB)
+                            if is_first_chunk:
+                                ttfb = time.time() - conn_start_time
+                                log(f"微软服务器已响应 (首包耗时/TTFB: {ttfb:.2f}s)", "NET")
+                                is_first_chunk = False
+                            
                             if chunk["type"] == "audio":
                                 while is_playing:
                                     try:
@@ -198,7 +206,6 @@ def audio_producer(text_chunks, data_queue):
                                         chunk_size_total += len(chunk["data"])
                                         break
                                     except queue.Full:
-                                        # log("缓冲区满，等待消费...", "WARN") # 过于频繁，注释掉
                                         continue
                             elif chunk["type"] == "error":
                                 raise Exception(f"TTS Error: {chunk['message']}")
@@ -240,8 +247,8 @@ def audio_producer(text_chunks, data_queue):
 
 
 def play_clipboard():
-    """消费者 (完整日志版)"""
-    global is_playing, ffplay_process
+    """消费者 (极速响应版)"""
+    global is_playing, ffplay_process, start_press_time
     
     text = None
     text_chunks = None
@@ -255,9 +262,8 @@ def play_clipboard():
             with lock: is_playing = False
             return
             
-        # 内容预览 (关键日志)
         preview = text[:30].replace('\n', ' ')
-        log(f"捕获任务: [{preview}... ] (长度: {len(text)})", "DATA")
+        log(f"捕获任务: [{preview}...]", "DATA")
         
         stop_playback(clear_flags=False)
         
@@ -268,15 +274,23 @@ def play_clipboard():
         
         log(f"文本分块完成: 共 {len(text_chunks)} 块", "TEXT")
 
-        # [Final Check] 启动前最后确认状态，防止在分块期间用户已停止
+        # [Final Check] 启动前最后确认
         with lock:
             if not is_playing:
-                log("检测到停止信号，取消启动播放器", "INFO")
+                log("检测到停止信号，取消启动", "INFO")
                 return
 
         creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        
+        # === 极速启动参数 ===
+        # -fflags nobuffer: 禁用输入缓冲
+        # -flags low_delay: 启用低延迟模式
         proc = subprocess.Popen([
-            get_ffplay_path(), "-nodisp", "-autoexit", "-i", "pipe:0",
+            get_ffplay_path(), "-nodisp", "-autoexit", 
+            "-fflags", "nobuffer", 
+            "-flags", "low_delay",
+            "-strict", "experimental",
+            "-i", "pipe:0",
             "-af", f"atempo={SPEED}" if SPEED < 2.0 else "atempo=2.0,atempo={{SPEED/2}}",
             "-probesize", "4096", "-analyzeduration", "0", 
             "-loglevel", "error"
@@ -320,13 +334,14 @@ def play_clipboard():
                     byte_count += len(chunk_data)
                     chunk_idx += 1
                     
-                    # 关键日志：首包确认
+                    # === 延迟统计 ===
                     if first_byte_time is None:
                         first_byte_time = datetime.datetime.now()
-                        log(">> 首包数据已写入播放器 (声音开始)", "PLAY")
+                        latency = 0
+                        if start_press_time:
+                            latency = time.time() - start_press_time
+                        log(f"⚡ 首响延迟: {latency:.2f}秒 (声音开始)", "PERF")
                     
-                    # 进度日志：每写入一定数量包，或者是最后一段时
-                    # 10 个包大约是 0.5 秒左右的数据，适合做心跳
                     if chunk_idx % 10 == 0:
                         log(f"播放中... 已写入 {chunk_idx} 包 ({byte_count/1024:.1f} KB)", "PLAY")
                         
@@ -371,22 +386,17 @@ def play_clipboard():
 
 
 def on_hotkey():
-    """
-    快捷键回调：必须极速返回，防止 Windows 移除过慢的钩子
-    """
-    global is_playing
+    global is_playing, start_press_time
     
-    # 快速读取状态
-    with lock: 
-        current_state = is_playing
+    with lock: playing = is_playing
     
-    if current_state:
-        log(">> 快捷键触发: 停止 (异步处理) <<", "USER")
-        # 关键修改：停止操作包含进程等待，必须放入线程，不可阻塞钩子
+    if playing:
+        log(">> 用户触发停止 <<", "USER")
         threading.Thread(target=stop_playback, daemon=True).start()
     else:
-        log(">> 快捷键触发: 开始 (异步处理) <<", "USER")
-        # 先设置标志位防止重复触发
+        # 记录按下时间
+        start_press_time = time.time()
+        log(">> 用户触发朗读 <<", "USER")
         with lock: is_playing = True
         threading.Thread(target=play_clipboard, daemon=True).start()
 
@@ -398,7 +408,7 @@ def main():
 
     keyboard.add_hotkey('alt+c', on_hotkey)
     
-    log(f"=== ClipSpeak Pro (Verbose Trace) ===", "INIT")
+    log(f"=== ClipSpeak Pro (Low Latency) ===", "INIT")
     log(f"PID={os.getpid()} | Python {sys.version.split()[0]}", "INIT")
     
     try:

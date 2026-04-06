@@ -2,7 +2,7 @@
 """
 剪贴板朗读工具 (Low Latency Edition)
 快捷键: Alt+C
-- 极速启动：零缓冲播放参数
+- 流式播放：首包返回后立即开始
 - 性能监控：精确记录首响延迟
 """
 
@@ -13,16 +13,20 @@ import sys
 import os
 import datetime
 import socket
-import queue
 import traceback
 import asyncio
 import time
 import re
-import platform
 
 import edge_tts
 import keyboard
 import pyperclip
+from aiohttp import client_exceptions
+
+try:
+    EDGE_TTS_VERSION = edge_tts.__version__
+except AttributeError:
+    EDGE_TTS_VERSION = "unknown"
 
 
 def get_ffplay_path():
@@ -36,16 +40,18 @@ def get_ffplay_path():
 
 # --- 核心配置 ---
 VOICE = "zh-CN-XiaoxiaoNeural"
-RATE = "+100%"  
-SPEED = 1.5     
-CHUNK_MIN_SIZE = 300
-CHUNK_MAX_SIZE = 800
-HARD_LIMIT_SIZE = 1000
+RATE = "+0%"
+SPEED = 3.0
+NETWORK_TIMEOUT_SECONDS = 15
+MAX_RETRIES = 6
+RETRY_BASE_DELAY = 1.2
 
 lock = threading.Lock()
 is_playing = False
 ffplay_process = None
 start_press_time = None # 记录按下快捷键的时间
+playback_session_id = 0
+current_audio_file = None
 
 RE_SPLIT = re.compile(r'([。！？；!?;])')
 
@@ -56,6 +62,29 @@ def log(msg, level="INFO"):
     print(f"[{timestamp}] [{level}] {msg}")
 
 
+def build_atempo_filter(speed):
+    """ffmpeg atempo 单次仅支持 0.5-2.0，超出时需要串联。"""
+    filters = []
+    remaining = speed
+
+    while remaining > 2.0:
+        filters.append("atempo=2.0")
+        remaining /= 2.0
+
+    filters.append(f"atempo={remaining:.3f}".rstrip("0").rstrip("."))
+    return ",".join(filters)
+
+
+def get_session_state():
+    with lock:
+        return playback_session_id, is_playing, ffplay_process, current_audio_file
+
+
+def is_session_active(session_id):
+    with lock:
+        return is_playing and playback_session_id == session_id
+
+
 def log_memory_stats():
     """内存健康度检查"""
     gc.collect()
@@ -63,40 +92,82 @@ def log_memory_stats():
     log(f"内存快照: 对象数 {obj_count} | GC: {gc.get_stats()}", "MEM")
 
 
+def explain_network_error(exc):
+    """给 edge-tts 常见网络错误补充更具体的诊断信息。"""
+    message = str(exc)
+
+    if "speech.platform.bing.com" in message:
+        return (
+            "当前请求被 speech.platform.bing.com 主动断开。"
+            "这更像是到微软 TTS 服务的链路波动，而不是播放器本身故障。"
+        )
+
+    if "api.msedgeservices.com" in message:
+        return "已命中新版 Edge TTS 接口，当前更像是本机网络、代理或防火墙导致的连接中断。"
+
+    if "Timeout" in message or "timed out" in message:
+        return "请求超时，可能是到微软 TTS 服务的链路不稳定。"
+
+    return None
+
+
+def is_expected_tts_error(exc):
+    return isinstance(
+        exc,
+        (
+            client_exceptions.ClientError,
+            asyncio.TimeoutError,
+            TimeoutError,
+            ConnectionError,
+            OSError,
+        ),
+    )
+
+
 def check_singleton():
     """单例检查"""
     try:
         lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        lock_socket.bind(('127.0.0.1', 45678)) 
+        lock_socket.bind(('127.0.0.1', 29921)) 
         return lock_socket
-    except socket.error:
+    except socket.error as e:
+        print(f"Socket bind error: {e}")
         return None
 
 
-def stop_playback(clear_flags=True):
+def stop_playback(clear_flags=True, session_id=None):
     """停止播放并执行深度清理"""
-    global is_playing, ffplay_process
+    global is_playing, ffplay_process, current_audio_file
     
     with lock:
+        if session_id is not None and playback_session_id != session_id:
+            return
         if clear_flags:
             if is_playing:
                 log("状态机变更: Running -> Stopped", "STATE")
             is_playing = False
         proc = ffplay_process
+        audio_file = current_audio_file
         ffplay_process = None
+        current_audio_file = None
     
     if proc:
-        log(f"终止播放器进程 (PID: {proc.pid})", "CLEAN")
+        proc_returncode = proc.poll()
+        if proc_returncode is None:
+            log(f"终止播放器进程 (PID: {proc.pid})", "CLEAN")
+        else:
+            log(f"播放器进程已退出 (PID: {proc.pid}, Exit Code: {proc_returncode})", "CLEAN")
         try:
             proc.stdin.close()
         except: pass
-        try:
-            proc.terminate()
-            proc.wait(timeout=1)
-        except:
+        if proc_returncode is None:
             try:
-                proc.kill()
-            except: pass
+                proc.terminate()
+                proc.wait(timeout=1)
+            except:
+                try:
+                    proc.kill()
+                except: pass
     
     if sys.platform == "win32":
         try:
@@ -104,156 +175,158 @@ def stop_playback(clear_flags=True):
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except: pass
 
+    if audio_file:
+        try:
+            os.unlink(audio_file)
+            log(f"清理临时音频文件: {audio_file}", "CLEAN")
+        except OSError:
+            pass
 
-def split_text_smart_v3(text):
-    """分块算法"""
+
+def normalize_text(text):
+    """轻量清洗文本，避免 markdown 噪音影响朗读。"""
     text = text.replace("#", "").replace("*", "").replace("\r", "")
-    if not text.strip(): return []
-    
-    raw_lines = text.split('\n')
-    chunks = []
-    buffer = ""
-    
-    for line in raw_lines:
-        line = line.strip()
-        if not line: continue
-            
-        if len(buffer) + len(line) < CHUNK_MIN_SIZE:
-            buffer += line + "，" 
-            continue
-        
-        if buffer:
-            chunks.append(buffer)
-            buffer = ""
-            
-        if len(line) < CHUNK_MAX_SIZE:
-            if len(line) > CHUNK_MIN_SIZE:
-                chunks.append(line)
-            else:
-                buffer = line + "，"
-        else:
-            log(f"处理长难句 ({len(line)}字符)，执行硬切分", "TEXT")
-            sub_parts = RE_SPLIT.split(line)
-            sub_buffer = ""
-            for part in sub_parts:
-                if len(part) > HARD_LIMIT_SIZE:
-                    if sub_buffer:
-                        chunks.append(sub_buffer)
-                        sub_buffer = ""
-                    for k in range(0, len(part), HARD_LIMIT_SIZE):
-                        chunks.append(part[k:k+HARD_LIMIT_SIZE])
-                elif len(sub_buffer) + len(part) > CHUNK_MAX_SIZE:
-                    if sub_buffer: chunks.append(sub_buffer)
-                    sub_buffer = part
-                else:
-                    sub_buffer += part
-            if sub_buffer: chunks.append(sub_buffer)
-    
-    if buffer: chunks.append(buffer)
-    
-    return chunks
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
-def audio_producer(text_chunks, data_queue):
-    """生产者 (完整日志版)"""
-    global is_playing
-    total_chunks = len(text_chunks)
-    log(f"下载线程启动 (任务队列: {total_chunks})", "NET")
-    
+def open_ffplay_process():
+    """启动 ffplay，并准备从 stdin 接收音频流。"""
+    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    ffplay_args = [
+        get_ffplay_path(),
+        "-nodisp",
+        "-autoexit",
+        "-i",
+        "pipe:0",
+    ]
+
+    # 流式 mp3 再叠加极端低延迟/二次加速时，容易出现中后段听感跳跃。
+    # 默认改成只使用 TTS 请求端 2x，播放器侧保持 1x，更稳。
+    if abs(SPEED - 1.0) > 0.001:
+        ffplay_args.extend(["-af", build_atempo_filter(SPEED)])
+
+    ffplay_args.extend(["-loglevel", "error"])
+
+    return subprocess.Popen(
+        ffplay_args,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=sys.stderr,
+        creationflags=creationflags,
+    )
+
+
+def stream_audio_to_ffplay(text, session_id):
+    """直接把 edge-tts 音频流写给 ffplay，实现首包即播。"""
+    global ffplay_process
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    
+
     try:
-        for i, chunk_text in enumerate(text_chunks):
-            with lock:
-                if not is_playing: break
-            
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    start_time = time.time()
-                    log(f"-> 开始下载第 {i+1}/{total_chunks} 段 ({len(chunk_text)} 字符)...", "NET")
-                    
-                    conn_start_time = time.time() # 记录连接开始时间
-                    
-                    communicate = edge_tts.Communicate(chunk_text, VOICE, rate=RATE)
-                    async_gen = communicate.stream()
-                    iterator = async_gen.__aiter__()
-                    
-                    chunk_size_total = 0
-                    is_first_chunk = True # 标记是否为首包
-                    
-                    while True:
-                        with lock:
-                            if not is_playing: break
-                        
+        for attempt in range(MAX_RETRIES):
+            if not is_session_active(session_id):
+                return False
+
+            proc = None
+            first_chunk_time = None
+            try:
+                start_time = time.time()
+                bytes_written = 0
+                log(f"-> 开始流式生成音频 ({len(text)} 字符)...", "NET")
+                proc = open_ffplay_process()
+                with lock:
+                    if playback_session_id != session_id or not is_playing:
                         try:
-                            # 10s 超时
-                            chunk = loop.run_until_complete(
-                                asyncio.wait_for(iterator.__anext__(), timeout=10)
-                            )
-                            
-                            # 记录首包到达时间 (TTFB)
-                            if is_first_chunk:
-                                ttfb = time.time() - conn_start_time
-                                log(f"微软服务器已响应 (首包耗时/TTFB: {ttfb:.2f}s)", "NET")
-                                is_first_chunk = False
-                            
-                            if chunk["type"] == "audio":
-                                while is_playing:
-                                    try:
-                                        data_queue.put(chunk["data"], timeout=1)
-                                        chunk_size_total += len(chunk["data"])
-                                        break
-                                    except queue.Full:
-                                        continue
-                            elif chunk["type"] == "error":
-                                raise Exception(f"TTS Error: {chunk['message']}")
-                                
-                        except StopAsyncIteration:
-                            break
-                        except asyncio.TimeoutError:
-                            raise Exception("Network Timeout (10s)")
-                    
-                    duration = time.time() - start_time
-                    log(f"<- 第 {i+1} 段下载完成 ({chunk_size_total/1024:.1f} KB, 耗时 {duration:.2f}s)", "NET")
-                    break 
-                    
-                except Exception as e:
-                    with lock:
-                        if not is_playing: break
-                    
-                    if attempt < max_retries - 1:
-                        log(f"!! 网络连接失败: {e}. 1s后重试 ({attempt+1}/{max_retries})", "WARN")
-                        time.sleep(1.0)
-                    else:
-                        log(f"!! 第 {i+1} 段下载最终失败: {e}", "ERR")
-            
-    except Exception as e:
-        log(f"生产者线程崩溃: {e}", "FATAL")
-        traceback.print_exc()
+                            proc.terminate()
+                        except Exception:
+                            pass
+                        return False
+                    ffplay_process = proc
+
+                log(f"播放器进程已挂载 (PID: {proc.pid})", "PROC")
+                log("开始等待音频首包并直接播放", "INFO")
+                communicate = edge_tts.Communicate(text, VOICE, rate=RATE)
+
+                async def pump_stream():
+                    nonlocal first_chunk_time, bytes_written
+                    async for chunk in communicate.stream():
+                        if not is_session_active(session_id):
+                            return
+                        if chunk["type"] != "audio":
+                            continue
+                        if proc.poll() is not None or proc.stdin is None:
+                            raise BrokenPipeError("ffplay 已提前退出")
+                        if first_chunk_time is None:
+                            first_chunk_time = time.time()
+                            latency = 0
+                            if start_press_time:
+                                latency = first_chunk_time - start_press_time
+                            log(f"⚡ 首响延迟: {latency:.2f}秒 (流式首包播放)", "PERF")
+                        proc.stdin.write(chunk["data"])
+                        proc.stdin.flush()
+                        bytes_written += len(chunk["data"])
+
+                loop.run_until_complete(
+                    asyncio.wait_for(pump_stream(), timeout=NETWORK_TIMEOUT_SECONDS * 8)
+                )
+
+                if proc.stdin:
+                    proc.stdin.close()
+                duration = time.time() - start_time
+                log(f"<- 音频流写入完成 ({bytes_written / 1024:.1f} KB, 耗时 {duration:.2f}s)", "NET")
+                return first_chunk_time is not None
+            except Exception as e:
+                hint = explain_network_error(e)
+                if hint:
+                    log(hint, "HINT")
+
+                if proc:
+                    try:
+                        if proc.stdin:
+                            proc.stdin.close()
+                    except Exception:
+                        pass
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=1)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+
+                if first_chunk_time is not None:
+                    log(f"!! 流式播放中断: {e}", "ERR")
+                    raise
+
+                if attempt < MAX_RETRIES - 1:
+                    retry_delay = RETRY_BASE_DELAY * (attempt + 1)
+                    log(
+                        f"!! 音频首包前失败: {e}. {retry_delay:.1f}s后重试 ({attempt+1}/{MAX_RETRIES})",
+                        "WARN",
+                    )
+                    time.sleep(retry_delay)
+                else:
+                    log(f"!! 音频流最终失败: {e}", "ERR")
+                    raise
     finally:
         try:
-            if loop.is_running(): loop.stop()
+            if loop.is_running():
+                loop.stop()
             if not loop.is_closed():
                 loop.run_until_complete(loop.shutdown_asyncgens())
-                loop.run_until_complete(asyncio.sleep(0.250)) 
+                loop.run_until_complete(asyncio.sleep(0.1))
                 loop.close()
-        except: pass
-        try:
-            data_queue.put(None, timeout=2)
-        except: pass
-        log("生产者线程退出", "NET")
+        except Exception:
+            pass
 
 
-def play_clipboard():
+def play_clipboard(session_id):
     """消费者 (极速响应版)"""
-    global is_playing, ffplay_process, start_press_time
+    global is_playing, ffplay_process, start_press_time, current_audio_file
     
     text = None
-    text_chunks = None
-    data_queue = None
-    producer_thread = None
     
     try:
         text = pyperclip.paste()
@@ -264,121 +337,56 @@ def play_clipboard():
             
         preview = text[:30].replace('\n', ' ')
         log(f"捕获任务: [{preview}...]", "DATA")
-        
-        stop_playback(clear_flags=False)
-        
-        text_chunks = split_text_smart_v3(text)
-        if not text_chunks:
-            with lock: is_playing = False
+
+        text = normalize_text(text)
+        if not text:
+            stop_playback(session_id=session_id)
             return
         
-        log(f"文本分块完成: 共 {len(text_chunks)} 块", "TEXT")
+        if not is_session_active(session_id):
+            log("检测到停止信号，取消启动", "INFO")
+            return
 
-        # [Final Check] 启动前最后确认
-        with lock:
-            if not is_playing:
-                log("检测到停止信号，取消启动", "INFO")
-                return
+        started = stream_audio_to_ffplay(text, session_id)
+        if not started:
+            stop_playback(session_id=session_id)
+            return
 
-        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        
-        # === 极速启动参数 ===
-        # -fflags nobuffer: 禁用输入缓冲
-        # -flags low_delay: 启用低延迟模式
-        proc = subprocess.Popen([
-            get_ffplay_path(), "-nodisp", "-autoexit", 
-            "-fflags", "nobuffer", 
-            "-flags", "low_delay",
-            "-strict", "experimental",
-            "-i", "pipe:0",
-            "-af", f"atempo={SPEED}" if SPEED < 2.0 else "atempo=2.0,atempo={{SPEED/2}}",
-            "-probesize", "4096", "-analyzeduration", "0", 
-            "-loglevel", "error"
-        ], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=sys.stderr, creationflags=creationflags)
-        
-        with lock:
-            ffplay_process = proc
-        
-        log(f"播放器进程已挂载 (PID: {proc.pid})", "PROC")
-
-        data_queue = queue.Queue(maxsize=100)
-        producer_thread = threading.Thread(
-            target=audio_producer, 
-            args=(text_chunks, data_queue), 
-            daemon=True
-        )
-        producer_thread.start()
-        
-        log("等待数据流...", "INFO")
-        byte_count = 0
-        chunk_idx = 0
-        first_byte_time = None
+        log("音频流已发送完毕，等待播放器自然结束", "INFO")
         
         while True:
-            with lock:
-                if not is_playing: break
-                current_proc = ffplay_process
+            current_session_id, playing, current_proc, _ = get_session_state()
+            if not playing or current_session_id != session_id:
+                break
             
             if current_proc and current_proc.poll() is not None:
-                log(f"播放器意外退出 (Exit Code: {current_proc.returncode})", "ERR")
+                log(f"播放器进程结束 (Exit Code: {current_proc.returncode})", "INFO")
                 break
-                
-            try:
-                chunk_data = data_queue.get(timeout=0.5)
-                if chunk_data is None:
-                    log("收到 EOF 结束信号", "INFO")
-                    break
-                
-                try:
-                    current_proc.stdin.write(chunk_data)
-                    byte_count += len(chunk_data)
-                    chunk_idx += 1
-                    
-                    # === 延迟统计 ===
-                    if first_byte_time is None:
-                        first_byte_time = datetime.datetime.now()
-                        latency = 0
-                        if start_press_time:
-                            latency = time.time() - start_press_time
-                        log(f"⚡ 首响延迟: {latency:.2f}秒 (声音开始)", "PERF")
-                    
-                    if chunk_idx % 10 == 0:
-                        log(f"播放中... 已写入 {chunk_idx} 包 ({byte_count/1024:.1f} KB)", "PLAY")
-                        
-                except Exception as e:
-                    log(f"写入管道失败: {e}", "ERR")
-                    break
-                    
-            except queue.Empty:
-                if not producer_thread.is_alive():
-                    log("数据源已耗尽", "INFO")
-                    break
-                log("缓冲中... (Waiting for Net)", "WARN")
-                continue
+            time.sleep(0.2)
 
-        log(f"播放结束 (总流量: {byte_count/1024:.2f} KB)", "INFO")
+        log("播放结束", "INFO")
         
-        with lock:
-            current_proc = ffplay_process
-            still_playing = is_playing
+        current_session_id, still_playing, current_proc, _ = get_session_state()
         
-        if current_proc and still_playing:
+        if current_proc and still_playing and current_session_id == session_id:
             try:
-                current_proc.stdin.close()
                 current_proc.wait(timeout=3)
             except: pass
 
     except Exception as e:
-        log(f"主线程异常: {e}", "FATAL")
-        traceback.print_exc()
+        if is_expected_tts_error(e):
+            hint = explain_network_error(e)
+            if hint:
+                log(hint, "HINT")
+            log(f"本次朗读失败: {e}", "ERR")
+        else:
+            log(f"主线程异常: {e}", "FATAL")
+            traceback.print_exc()
     finally:
         log("开始资源回收...", "CLEAN")
-        stop_playback()
-        
-        if data_queue:
-            with data_queue.mutex: data_queue.queue.clear()
-        
-        del text, text_chunks, data_queue, producer_thread
+        stop_playback(session_id=session_id)
+
+        del text
         gc.collect()
         
         log_memory_stats()
@@ -386,9 +394,10 @@ def play_clipboard():
 
 
 def on_hotkey():
-    global is_playing, start_press_time
+    global is_playing, start_press_time, playback_session_id
     
-    with lock: playing = is_playing
+    with lock:
+        playing = is_playing
     
     if playing:
         log(">> 用户触发停止 <<", "USER")
@@ -396,9 +405,12 @@ def on_hotkey():
     else:
         # 记录按下时间
         start_press_time = time.time()
-        log(">> 用户触发朗读 <<", "USER")
-        with lock: is_playing = True
-        threading.Thread(target=play_clipboard, daemon=True).start()
+        with lock:
+            playback_session_id += 1
+            session_id = playback_session_id
+            is_playing = True
+        log(f">> 用户触发朗读 << (会话 {session_id})", "USER")
+        threading.Thread(target=play_clipboard, args=(session_id,), daemon=True).start()
 
 
 def main():
@@ -410,6 +422,7 @@ def main():
     
     log(f"=== ClipSpeak Pro (Low Latency) ===", "INIT")
     log(f"PID={os.getpid()} | Python {sys.version.split()[0]}", "INIT")
+    log(f"edge-tts={EDGE_TTS_VERSION}", "INIT")
     
     try:
         keyboard.wait()

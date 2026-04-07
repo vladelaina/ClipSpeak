@@ -185,6 +185,9 @@ def stop_playback(clear_flags=True, session_id=None):
 
 def normalize_text(text):
     """轻量清洗文本，避免 markdown 噪音影响朗读。"""
+    # Markdown 链接只保留可见文本，不朗读括号里的 URL。
+    text = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
     text = text.replace("#", "").replace("*", "").replace("\r", "")
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()

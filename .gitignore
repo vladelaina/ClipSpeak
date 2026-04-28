@@ -2,3 +2,7 @@ build/
 dist/
 *.spec
 __pycache__/
+tools/ffmpeg/*
+!tools/
+!tools/ffmpeg/
+!tools/ffmpeg/.gitkeep
